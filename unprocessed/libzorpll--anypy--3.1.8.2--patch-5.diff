@@ -1,0 +1,165 @@
+* finding or making libzorpll--anypy--3.1.8.2--base-0
+* build reference tree for mag@debian.org--2003-zorp/libzorpll--anypy--3.1.8.2--base-0
+* from import revision: mag@debian.org--2003-zorp/libzorpll--upstream--3.1.8.2--base-0
+* patching for revision: mag@debian.org--2003-zorp/libzorpll--upstream--3.1.8.2--patch-1
+* patching for revision: mag@debian.org--2003-zorp/libzorpll--anypy--3.1.8.2--base-0
+* finding or making libzorpll--anypy--3.1.8.2--patch-5
+* build reference tree for mag@debian.org--2003-zorp/libzorpll--anypy--3.1.8.2--patch-5
+* from import revision: mag@debian.org--2003-zorp/libzorpll--upstream--3.1.8.2--base-0
+* patching for revision: mag@debian.org--2003-zorp/libzorpll--upstream--3.1.8.2--patch-1
+* patching for revision: mag@debian.org--2003-zorp/libzorpll--anypy--3.1.8.2--base-0
+* patching for revision: mag@debian.org--2003-zorp/libzorpll--anypy--3.1.8.2--patch-1
+* patching for revision: mag@debian.org--2003-zorp/libzorpll--anypy--3.1.8.2--patch-2
+* patching for revision: mag@debian.org--2003-zorp/libzorpll--anypy--3.1.8.2--patch-3
+* patching for revision: mag@debian.org--2003-zorp/libzorpll--anypy--3.1.8.2--patch-4
+* patching for revision: mag@debian.org--2003-zorp/libzorpll--anypy--3.1.8.2--patch-5
+* computing changeset
+A  {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-1
+A  {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-2
+A  {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-3
+A  {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-4
+A  {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-5
+M  src/zorp/streamline.h
+M  src/streamline.c
+* changeset report
+* added files
+
+    {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-1
+    {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-2
+    {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-3
+    {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-4
+    {arch}/libzorpll/libzorpll--anypy/libzorpll--anypy--3.1.8.2/mag@debian.org--2003-zorp/patch-log/patch-5
+
+* modified files
+
+--- orig/src/streamline.c
++++ mod/src/streamline.c
+@@ -645,6 +645,45 @@
+         }
+       break;
+ 
++    case ZST_LINE_SET_EOL_MARK:
++      if (vlen == sizeof(gchar))
++        {
++          gchar mark = *((gchar *)value);
++          if ((mark&ZRL_EOL_MASK)&&
++              ((mark=ZRL_EOL_NL)||
++               (mark=ZRL_EOL_CRLF)||
++               (mark=ZRL_EOL_NUL)))
++            {
++              self->flags |= (mark&ZRL_EOL_MASK);
++              z_return(TRUE);
++            }
++        }
++      break;
++
++    case ZST_LINE_SET_EOL_FATAL:
++      if (vlen == sizeof(gboolean))
++        {
++          gboolean flag = *((gboolean *)value);
++          if (flag)
++            self->flags |= ZRL_EOL_FATAL;
++          else
++            self->flags &= ~ZRL_EOL_FATAL;
++          z_return(TRUE);
++        }
++      break;
++
++    case ZST_LINE_SET_RETURN_EOL:
++      if (vlen == sizeof(gboolean))
++        {
++          gboolean flag = *((gboolean *)value);
++          if (flag)
++            self->flags |= ZRL_RETURN_EOL;
++          else
++            self->flags &= ~ZRL_RETURN_EOL;
++          z_return(TRUE);
++        }
++      break;
++
+     case ZST_LINE_GET_TRUNCATE:
+       if (vlen == sizeof(gboolean))
+         {
+@@ -661,6 +700,14 @@
+         }
+       break;
+       
++      case ZST_LINE_GET_NUL_NONFATAL:
++        if (vlen == sizeof(gboolean))
++          {
++            *(gboolean *)value = !!(self->flags & ZRL_NUL_NONFATAL);
++            return TRUE; /* z_return(TRUE) in 3.1.8 */
++          }
++        break;
++
+     case ZST_LINE_GET_SINGLE_READ:
+       if (vlen == sizeof(gboolean))
+         {
+@@ -676,6 +723,30 @@
+           z_return(TRUE);
+         }
+       break;
++
++    case ZST_LINE_GET_EOL_MARK:
++      if (vlen == sizeof(gchar))
++        {
++          *(gchar *)value = (self->flags & ZRL_EOL_MASK);
++          z_return(TRUE);
++        }
++      break;
++
++    case ZST_LINE_GET_EOL_FATAL:
++      if (vlen == sizeof(gboolean))
++        {
++          *(gboolean *)value = !!(self->flags & ZRL_EOL_FATAL);
++          z_return(TRUE);
++        }
++      break;
++
++    case ZST_LINE_GET_RETURN_EOL:
++      if (vlen == sizeof(gboolean))
++        {
++          *(gboolean *)value = !!(self->flags & ZRL_RETURN_EOL);
++          z_return(TRUE);
++        }
++      break;
+       
+     case ZST_CTRL_SET_CALLBACK_READ:
+     case ZST_CTRL_SET_CALLBACK_WRITE:
+
+
+--- orig/src/zorp/streamline.h
++++ mod/src/zorp/streamline.h
+@@ -22,6 +22,7 @@
+ #define ZRL_EOL_NL		0x00000001 /* end-of-line is indicated by nl */
+ #define ZRL_EOL_CRLF		0x00000002 /* end-of-line is indicated by crlf pair */
+ #define ZRL_EOL_NUL		0x00000004
++#define ZRL_EOL_MASK            0x00000007
+ #define ZRL_EOL_FATAL		0x00000008 /* erroneous eol mark is fatal */
+ #define ZRL_NUL_NONFATAL        0x00000010 /* embedded NUL character is not fatal */
+ 
+@@ -36,13 +37,20 @@
+ #define ZST_LINE_GET_SPLIT        (0x02) | ZST_LINE_OFS
+ #define ZST_LINE_GET_SINGLE_READ  (0x03) | ZST_LINE_OFS
+ #define ZST_LINE_GET_POLL_PARTIAL (0x04) | ZST_LINE_OFS
++#define ZST_LINE_GET_NUL_NONFATAL (0x05) | ZST_LINE_OFS
++#define ZST_LINE_GET_EOL_MARK     (0x06) | ZST_LINE_OFS
++#define ZST_LINE_GET_EOL_FATAL    (0x07) | ZST_LINE_OFS
++#define ZST_LINE_GET_RETURN_EOL   (0x08) | ZST_LINE_OFS
+ #define ZST_LINE_GET_PARTIAL_READ ZST_LINE_GET_POLL_PARTIAL
+ 
+ #define ZST_LINE_SET_TRUNCATE     (0x11) | ZST_LINE_OFS
+ #define ZST_LINE_SET_SPLIT        (0x12) | ZST_LINE_OFS
+ #define ZST_LINE_SET_SINGLE_READ  (0x13) | ZST_LINE_OFS
+-#define ZST_LINE_SET_NUL_NONFATAL (0x15) | ZST_LINE_OFS
+ #define ZST_LINE_SET_POLL_PARTIAL (0x14) | ZST_LINE_OFS
++#define ZST_LINE_SET_NUL_NONFATAL (0x15) | ZST_LINE_OFS
++#define ZST_LINE_SET_EOL_MARK     (0x16) | ZST_LINE_OFS
++#define ZST_LINE_SET_EOL_FATAL    (0x17) | ZST_LINE_OFS
++#define ZST_LINE_SET_RETURN_EOL   (0x18) | ZST_LINE_OFS
+ #define ZST_LINE_SET_PARTIAL_READ ZST_LINE_SET_POLL_PARTIAL
+ 
+ #ifdef __cplusplus
+
+
+

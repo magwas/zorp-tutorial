@@ -1,0 +1,1052 @@
+diff --git a/debian/control b/debian/control
+index c9dde19..d53516d 100644
+--- a/debian/control
++++ b/debian/control
+@@ -3,7 +3,7 @@ Section: net
+ Priority: optional
+ Maintainer: SZALAY Attila <sasa@debian.org>
+ Standards-Version: 3.5.6
+-Build-Depends: python-dev (>= 2.3), libssl-dev (>= 0.9.7), libglib2.0-dev (>= 2.2.1), libzorpll-dev (>= 3.1.8.0.3), debhelper, libcap-dev
++Build-Depends: python2.4-dev, libssl-dev (>= 0.9.7), libglib2.0-dev (>= 2.2.1), libzorpll-dev (>= 3.1.8.0.3), debhelper, libcap-dev
+ 
+ Package: zorp
+ Section: net
+@@ -30,7 +30,7 @@ Description: An advanced protocol analyzing firewall
+ Package: zorp-dev
+ Section: devel
+ Architecture: any
+-Depends: python-dev (>= 1.5.2), zorp (= ${Source-Version}), libzorpll-dev
++Depends: python2.4-dev (>= 1.5.2), zorp (= ${Source-Version}), libzorpll-dev
+ Description: Development files needed to compile Zorp modules.
+  Zorp is a new generation firewall. It is essentially a transparent proxy
+  firewall, with strict protocol analyzing proxies, a modular architecture,
+diff --git a/debian/zorp-modules.files b/debian/zorp-modules.files
+index e69de29..2d8e0c6 100644
+--- a/debian/zorp-modules.files
++++ b/debian/zorp-modules.files
+@@ -0,0 +1,17 @@
++usr/lib/zorp/libanypy.*
++usr/share/zorp/pylib/Zorp/AnyPy.py
++usr/lib/zorp/libfinger.*
++usr/share/zorp/pylib/Zorp/Finger.py
++usr/lib/zorp/libftp.*
++usr/share/zorp/pylib/Zorp/Ftp.py
++usr/lib/zorp/libhttp.*
++usr/share/zorp/pylib/Zorp/Http.py
++usr/share/zorp/http/*
++usr/lib/zorp/libplug.*
++usr/share/zorp/pylib/Zorp/Plug.py
++usr/lib/zorp/libpssl.*
++usr/share/zorp/pylib/Zorp/Pssl.py
++usr/lib/zorp/libwhois*
++usr/share/zorp/pylib/Zorp/Whois.py
++usr/lib/zorp/libtelnet*
++usr/share/zorp/pylib/Zorp/Telnet.py
+diff --git a/lib/proxy.c b/lib/proxy.c
+index 739df04..1ea9eaa 100644
+--- a/lib/proxy.c
++++ b/lib/proxy.c
+@@ -363,8 +363,8 @@ z_proxy_connect_server(ZProxy *self, const gchar *host, gint port)
+     {
+       rc = FALSE;
+     }
+-    
+- error:
++
++ error:    
+   z_policy_var_unref(res);
+ 
+   z_policy_thread_release(self->thread);
+@@ -838,6 +838,60 @@ z_proxy_set_session_dict(ZProxy *self, ZPolicyDict *dict_session)
+   self->dict_session = dict_session;
+ }
+ 
++
++/**
++ * FIXME: we may want to add functions to manipulate self->endpoints and
++ * update self->py_endpoints whenever self->endpoints changes. The
++ * implementation here basically assumes that whenever self->endpoints
++ * changes the Python layer queries proxy.client_stream or
++ * proxy.server_stream. If this is not the case the Python layer may use a
++ * stale stream.
++ **/
++static ZPolicyObj *
++z_proxy_query_stream(ZProxy *self, gchar *name, gpointer value G_GNUC_UNUSED)
++{
++  ZPolicyObj *res;
++  gint side;
++
++  z_proxy_enter(self);
++  if (strcmp(name, "client_stream") == 0)
++    {
++      side = EP_CLIENT;
++    }
++  else if (strcmp(name, "server_stream") == 0)
++    {
++      side = EP_SERVER;
++    }
++  else
++    {
++      g_assert_not_reached();
++    }
++  res = self->py_endpoints[side];
++  if (!res)
++    {
++      /* no stream yet in cache */
++      if (self->endpoints[side])
++        {
++          /* but there is one in C side */
++          self->py_endpoints[side] = res = z_policy_stream_new(self->endpoints[side]);
++        }
++      else
++        {
++          res = z_policy_none;
++        }
++    }
++  else if (((ZPolicyStream *) res)->stream != self->endpoints[side]) 
++    {
++      /* the cache is out of sync */
++      z_stream_unref(((ZPolicyStream *)res)->stream);
++      z_stream_ref(self->endpoints[side]);
++      ((ZPolicyStream *)res)->stream = self->endpoints[side];
++    }
++  z_policy_var_ref(res);
++  z_proxy_leave(self);
++  return res;
++}
++
+ /* methods for the ZProxy class */
+ 
+ /**
+@@ -854,6 +908,12 @@ z_proxy_config_method(ZProxy *self)
+   z_proxy_var_new(self, "language", 
+                   Z_VAR_TYPE_STRING | Z_VAR_GET | Z_VAR_SET_CONFIG | Z_VAR_GET_CONFIG,
+                   self->language);
++  z_proxy_var_new(self, "client_stream",
++                  Z_VAR_TYPE_CUSTOM | Z_VAR_GET,
++                  NULL, z_proxy_query_stream, NULL, NULL);
++  z_proxy_var_new(self, "server_stream",
++                  Z_VAR_TYPE_CUSTOM | Z_VAR_GET,
++                  NULL, z_proxy_query_stream, NULL, NULL);
+   return z_proxy_policy_config(self);
+ }
+ 
+@@ -948,6 +1008,10 @@ z_proxy_destroy_method(ZProxy *self)
+     {  
+       for (i = EP_CLIENT; i <= EP_SERVER; i++)
+         {
++          z_policy_thread_acquire(thread);
++          z_policy_var_unref(self->py_endpoints[i]);
++          z_policy_thread_release(thread);
++          
+           if (self->endpoints[i])
+             {
+               z_stream_shutdown(self->endpoints[i], SHUT_RDWR, NULL);
+diff --git a/lib/pystream.c b/lib/pystream.c
+index 2ba6f21..22c70e4 100644
+--- a/lib/pystream.c
++++ b/lib/pystream.c
+@@ -36,6 +36,7 @@
+ #include <zorp/log.h>
+ #include <zorp/stream.h>
+ #include <zorp/streamfd.h>
++#include <zorp/streamline.h>
+ #include <zorp/policy.h>
+ 
+ PyObject *z_policy_stream_new(ZStream *Stream);
+@@ -47,7 +48,11 @@ static gint z_policy_stream_setattr(PyObject *o, char *name,
+ static PyObject *z_policy_stream_repr(PyObject *o);
+ static PyObject *z_policy_stream_read(PyObject *o, PyObject *args);
+ static PyObject *z_policy_stream_write(PyObject *o, PyObject *args);
++static PyObject *z_policy_stream_write_chunk(PyObject *o, PyObject *args);
+ static PyObject *z_policy_stream_close(PyObject *o, PyObject *args);
++static PyObject *z_policy_stream_readline(PyObject *o, PyObject *args);
++
++static PyObject *z_policy_stream_exception = NULL; 
+ 
+ PyMethodDef z_policy_stream_funcs[] =
+ {
+@@ -59,7 +64,9 @@ static PyMethodDef py_zorp_stream_methods[] =
+ {
+   { "read",        z_policy_stream_read, METH_VARARGS, NULL },
+   { "write",       z_policy_stream_write, METH_VARARGS, NULL },
++  { "write_chunk",       z_policy_stream_write_chunk, METH_VARARGS, NULL },
+   { "close",       (PyCFunction) z_policy_stream_close, 0, NULL },
++  { "readline",        z_policy_stream_readline, METH_VARARGS, NULL },
+   { NULL,          NULL, 0, NULL }   /* sentinel*/
+ };
+ 
+@@ -197,6 +204,60 @@ z_policy_stream_getattr(PyObject *o, char *name)
+     {
+       return PyLong_FromUnsignedLong(self->stream->bytes_sent);
+     }
++  else if (strcmp(name, "truncate") == 0)
++    {
++      gboolean value;
++      z_stream_ctrl(self->stream, ZST_LINE_GET_TRUNCATE,  &value, sizeof(gboolean));
++      return Py_BuildValue("i", !!value);
++    }
++  else if (strcmp(name, "nul_nonfatal") == 0)
++    {
++      gboolean value;
++      z_stream_ctrl(self->stream, ZST_LINE_GET_NUL_NONFATAL,  &value, sizeof(gboolean));
++      return Py_BuildValue("i", !!value);
++    }
++  else if (strcmp(name, "split") == 0)
++    {
++      gboolean value;
++      z_stream_ctrl(self->stream, ZST_LINE_GET_SPLIT,  &value, sizeof(gboolean));
++      return Py_BuildValue("i", !!value);
++    }
++  else if (strcmp(name, "single_read") == 0)
++    {
++      gboolean value;
++      z_stream_ctrl(self->stream, ZST_LINE_GET_SINGLE_READ,  &value, sizeof(gboolean));
++      return Py_BuildValue("i", !!value);
++    }
++  else if (strcmp(name, "poll_partial") == 0)
++    {
++      gboolean value;
++      z_stream_ctrl(self->stream, ZST_LINE_GET_POLL_PARTIAL,  &value, sizeof(gboolean));
++      return Py_BuildValue("i", !!value);
++    }
++  else if (strcmp(name, "eol_mark") == 0)
++    {
++      gboolean value;
++      z_stream_ctrl(self->stream, ZST_LINE_GET_EOL_MARK,  &value, sizeof(gboolean));
++      return Py_BuildValue("i", !!value);
++    }
++  else if (strcmp(name, "eol_fatal") == 0)
++    {
++      gboolean value;
++      z_stream_ctrl(self->stream, ZST_LINE_GET_EOL_FATAL,  &value, sizeof(gboolean));
++      return Py_BuildValue("i", !!value);
++    }
++  else if (strcmp(name, "return_eol") == 0)
++    {
++      gboolean value;
++      z_stream_ctrl(self->stream, ZST_LINE_GET_RETURN_EOL,  &value, sizeof(gboolean));
++      return Py_BuildValue("i", !!value);
++    }
++  else if (strcmp(name, "nonblock") == 0)
++    {
++      gboolean value;
++      z_stream_ctrl(self->stream, ZST_CTRL_GET_NONBLOCK,  &value, sizeof(gboolean));
++      return Py_BuildValue("i", !!value);
++    }
+ 
+   return Py_FindMethod(py_zorp_stream_methods, o, name);
+ }
+@@ -232,6 +293,105 @@ z_policy_stream_setattr(PyObject *o, char *name,
+ 	  return 0;
+ 	}
+     }
++  else if (strcmp(name, "truncate") == 0)
++    {
++      int cval;
++      if (!PyArg_Parse(value, "i", &cval))
++	{
++	  PyErr_SetString(PyExc_TypeError, "truncate is boolean");
++	  return 1;
++	}
++      z_stream_ctrl(self->stream, ZST_LINE_SET_TRUNCATE,  &cval, sizeof(int));
++      return 0;
++    }
++  else if (strcmp(name, "nul_nonfatal") == 0)
++    {
++      int cval;
++      if (!PyArg_Parse(value, "i", &cval))
++	{
++	  PyErr_SetString(PyExc_TypeError, "nul_nonfatal is boolean");
++	  return 1;
++	}
++      z_stream_ctrl(self->stream, ZST_LINE_SET_NUL_NONFATAL,  &cval, sizeof(int));
++      return 0;
++    }
++  else if (strcmp(name, "split") == 0)
++    {
++      int cval;
++      if (!PyArg_Parse(value, "i", &cval))
++	{
++	  PyErr_SetString(PyExc_TypeError, "split is boolean");
++	  return 1;
++	}
++      z_stream_ctrl(self->stream, ZST_LINE_SET_SPLIT,  &cval, sizeof(int));
++      return 0;
++    }
++  else if (strcmp(name, "single_read") == 0)
++    {
++      int cval;
++      if (!PyArg_Parse(value, "i", &cval))
++	{
++	  PyErr_SetString(PyExc_TypeError, "single_read is boolean");
++	  return 1;
++	}
++      z_stream_ctrl(self->stream, ZST_LINE_SET_SINGLE_READ,  &cval, sizeof(int));
++      return 0;
++    }
++  else if (strcmp(name, "poll_partial") == 0)
++    {
++      int cval;
++      if (!PyArg_Parse(value, "i", &cval))
++	{
++	  PyErr_SetString(PyExc_TypeError, "poll_partial is boolean");
++	  return 1;
++	}
++      z_stream_ctrl(self->stream, ZST_LINE_SET_POLL_PARTIAL,  &cval, sizeof(int));
++      return 0;
++    }
++  else if (strcmp(name, "eol_mark") == 0)
++    {
++      int cval;
++      if (!PyArg_Parse(value, "i", &cval))
++	{
++	  PyErr_SetString(PyExc_TypeError, "eol_mark is bitfield");
++	  return 1;
++	}
++      z_stream_ctrl(self->stream, ZST_LINE_SET_EOL_MARK,  &cval, sizeof(int));
++      return 0;
++    }
++  else if (strcmp(name, "eol_fatal") == 0)
++    {
++      int cval;
++      if (!PyArg_Parse(value, "i", &cval))
++	{
++	  PyErr_SetString(PyExc_TypeError, "eol_fatal is boolean");
++	  return 1;
++	}
++      z_stream_ctrl(self->stream, ZST_LINE_SET_EOL_FATAL,  &cval, sizeof(int));
++      return 0;
++    }
++  else if (strcmp(name, "return_eol") == 0)
++    {
++      int cval;
++      if (!PyArg_Parse(value, "i", &cval))
++	{
++	  PyErr_SetString(PyExc_TypeError, "return_eol is boolean");
++	  return 1;
++	}
++      z_stream_ctrl(self->stream, ZST_LINE_SET_RETURN_EOL,  &cval, sizeof(int));
++      return 0;
++    }
++  else if (strcmp(name, "nonblock") == 0)
++    {
++      int cval;
++      if (!PyArg_Parse(value, "i", &cval))
++	{
++	  PyErr_SetString(PyExc_TypeError, "nonblock is boolean");
++	  return 1;
++	}
++      z_stream_ctrl(self->stream, ZST_CTRL_SET_NONBLOCK,  &cval, sizeof(int));
++      return 0;
++    }
+ 
+   PyErr_SetString(PyExc_AttributeError, "No such attribute");
+   return 1;
+@@ -251,6 +411,40 @@ z_policy_stream_repr(PyObject *o)
+   return PyString_FromString(self->stream->name);
+ }
+ 
++
++/**
++ * z_policy_stream_readline
++ * @o: Python self, ZPolicyStream object
++ * @args: Python args argument
++ *
++ * readline method exported to Python with this declaration:
++ *   def readline(self)
++ *
++ * gets a line from the stream
++ */
++ 
++static PyObject *
++z_policy_stream_readline(PyObject *o, PyObject *args G_GNUC_UNUSED)
++{
++  ZPolicyStream *self = (ZPolicyStream *) o;
++  gchar *buf;
++  PyObject *pybuf;
++  gsize bytes_read;
++  gint res;
++  
++  Py_BEGIN_ALLOW_THREADS
++  res = z_stream_line_get(self->stream, &buf, &bytes_read, NULL);
++  Py_END_ALLOW_THREADS
++  pybuf = Py_BuildValue("s#", buf, bytes_read);
++  if (res == G_IO_STATUS_NORMAL)
++    {
++      return pybuf;
++    }
++  PyErr_SetObject(z_policy_stream_exception, Py_BuildValue("(i,O)", res, pybuf));
++  return NULL;
++}
++
++
+ /**
+  * z_policy_stream_read:
+  * @o: Python self, ZPolicyStream object
+@@ -265,6 +459,7 @@ static PyObject *
+ z_policy_stream_read(PyObject *o, PyObject *args)
+ {
+   ZPolicyStream *self = (ZPolicyStream *) o;
++  PyObject *pybuf;
+   gchar *buf;
+   guint length;
+   gsize bytes_read;
+@@ -273,17 +468,19 @@ z_policy_stream_read(PyObject *o, PyObject *args)
+   if (!PyArg_ParseTuple(args, "i", &length))
+     return NULL;
+ 
+-  buf = alloca(length);
++  buf = g_new0(char, length);
+   Py_BEGIN_ALLOW_THREADS
+   res = z_stream_read(self->stream, buf, length, &bytes_read, NULL);
+   Py_END_ALLOW_THREADS
+-  
+-  if (res != G_IO_STATUS_NORMAL)
++  if (res == G_IO_STATUS_NORMAL)
+     {
+-      PyErr_SetString(PyExc_IOError, "I/O error reading stream.");
+-      return NULL;      
++      pybuf = Py_BuildValue("s#", buf, bytes_read);
++      g_free(buf);
++      return pybuf;
+     }
+-  return Py_BuildValue("s#", buf, bytes_read);
++  g_free(buf);
++  PyErr_SetObject(z_policy_stream_exception, Py_BuildValue("(i,O)", res, Py_None));
++  return NULL;
+ }
+ 
+ /**
+@@ -323,6 +520,43 @@ z_policy_stream_write(PyObject *o, PyObject *args)
+   return Py_None;
+ }
+ 
++/**
++ * z_policy_stream_write_chunk:
++ * @o: Python self, ZPolicyStream object
++ * @args: Python args argument
++ *
++ * read method exported to Python with this declaration: 
++ *   def read(buf):
++ *
++ * the buf argument is a Python string which contains the byte sequence to
++ * be written.
++ **/
++static PyObject *
++z_policy_stream_write_chunk(PyObject *o, PyObject *args)
++{
++  ZPolicyStream *self = (ZPolicyStream *) o;
++  gchar *buf; 
++  guint length;
++  gsize bytes_written;
++  gint res;
++  
++  if (!PyArg_ParseTuple(args, "s#", &buf, &length))
++    return NULL;
++    
++  Py_BEGIN_ALLOW_THREADS
++  res = z_stream_write_chunk(self->stream, buf, length, &bytes_written, NULL);
++  Py_END_ALLOW_THREADS
++  
++  if (res != G_IO_STATUS_NORMAL)
++    {
++      PyErr_SetString(PyExc_IOError, "I/O error writing stream.");
++      return NULL;
++    }
++  
++  Py_XINCREF(Py_None);
++  return Py_None;
++}
++
+ 
+ /**
+  * z_policy_stream_close:
+@@ -341,6 +575,17 @@ z_policy_stream_close(PyObject *o, PyObject *args G_GNUC_UNUSED)
+   return Py_None;
+ }
+ 
++static PyObject* z_policy_G_IO_IN ;
++static PyObject* z_policy_G_IO_OUT ;
++static PyObject* z_policy_G_IO_STATUS_ERROR ;
++static PyObject* z_policy_G_IO_STATUS_NORMAL ;
++static PyObject* z_policy_G_IO_STATUS_EOF ;
++static PyObject* z_policy_G_IO_STATUS_AGAIN ;
++static PyObject* z_policy_ZRL_EOL_NL ;
++static PyObject* z_policy_ZRL_EOL_CRLF ;
++static PyObject* z_policy_ZRL_EOL_NUL ;
++static PyObject* z_policy_ZRL_EOL_FATAL ;
++
+ /**
+  * z_policy_stream_init:
+  * 
+@@ -350,6 +595,24 @@ z_policy_stream_close(PyObject *o, PyObject *args G_GNUC_UNUSED)
+ void
+ z_policy_stream_module_init(void)
+ {
++  PyObject* module;
++
+   PyImport_AddModule("Zorp.Stream");
+-  Py_InitModule("Zorp.Stream", z_policy_stream_funcs);
++  module = Py_InitModule("Zorp.Stream", z_policy_stream_funcs);
++  
++  z_policy_stream_exception = PyErr_NewException("Zorp.Stream.StreamException", NULL, NULL);
++  Py_INCREF(z_policy_stream_exception);
++  PyModule_AddObject(module, "StreamException", z_policy_stream_exception);
++
++  //it was faster to generate some code than think about a nice macro
++	z_policy_G_IO_IN	= Py_BuildValue("i", G_IO_IN);	Py_INCREF(z_policy_G_IO_IN);	PyModule_AddObject(module, "G_IO_IN", z_policy_G_IO_IN);
++	z_policy_G_IO_OUT	= Py_BuildValue("i", G_IO_OUT);	Py_INCREF(z_policy_G_IO_OUT);	PyModule_AddObject(module, "G_IO_OUT", z_policy_G_IO_OUT);
++	z_policy_G_IO_STATUS_ERROR	= Py_BuildValue("i", G_IO_STATUS_ERROR);	Py_INCREF(z_policy_G_IO_STATUS_ERROR);	PyModule_AddObject(module, "G_IO_STATUS_ERROR", z_policy_G_IO_STATUS_ERROR);
++	z_policy_G_IO_STATUS_NORMAL	= Py_BuildValue("i", G_IO_STATUS_NORMAL);	Py_INCREF(z_policy_G_IO_STATUS_NORMAL);	PyModule_AddObject(module, "G_IO_STATUS_NORMAL", z_policy_G_IO_STATUS_NORMAL);
++	z_policy_G_IO_STATUS_EOF	= Py_BuildValue("i", G_IO_STATUS_EOF);	Py_INCREF(z_policy_G_IO_STATUS_EOF);	PyModule_AddObject(module, "G_IO_STATUS_EOF", z_policy_G_IO_STATUS_EOF);
++	z_policy_G_IO_STATUS_AGAIN	= Py_BuildValue("i", G_IO_STATUS_AGAIN);	Py_INCREF(z_policy_G_IO_STATUS_AGAIN);	PyModule_AddObject(module, "G_IO_STATUS_AGAIN", z_policy_G_IO_STATUS_AGAIN);
++	z_policy_ZRL_EOL_NL	= Py_BuildValue("i", ZRL_EOL_NL);	Py_INCREF(z_policy_ZRL_EOL_NL);	PyModule_AddObject(module, "ZRL_EOL_NL", z_policy_ZRL_EOL_NL);
++	z_policy_ZRL_EOL_CRLF	= Py_BuildValue("i", ZRL_EOL_CRLF);	Py_INCREF(z_policy_ZRL_EOL_CRLF);	PyModule_AddObject(module, "ZRL_EOL_CRLF", z_policy_ZRL_EOL_CRLF);
++	z_policy_ZRL_EOL_NUL	= Py_BuildValue("i", ZRL_EOL_NUL);	Py_INCREF(z_policy_ZRL_EOL_NUL);	PyModule_AddObject(module, "ZRL_EOL_NUL", z_policy_ZRL_EOL_NUL);
++	z_policy_ZRL_EOL_FATAL	= Py_BuildValue("i", ZRL_EOL_FATAL);	Py_INCREF(z_policy_ZRL_EOL_FATAL);	PyModule_AddObject(module, "ZRL_EOL_FATAL", z_policy_ZRL_EOL_FATAL);
+ }
+diff --git a/lib/zorp/proxy.h b/lib/zorp/proxy.h
+index 1bb49c0..df5b837 100644
+--- a/lib/zorp/proxy.h
++++ b/lib/zorp/proxy.h
+@@ -129,6 +129,7 @@ struct _ZProxy
+   GList *interfaces;
+   
+   ZStream *endpoints[EP_MAX];
++  ZPolicyObj *py_endpoints[EP_MAX];
+   
+   ZProxyFastpath fastpath;
+ };
+diff --git a/modules/anypy/AnyPy.py b/modules/anypy/AnyPy.py
+index 05944a6..6566776 100644
+--- a/modules/anypy/AnyPy.py
++++ b/modules/anypy/AnyPy.py
+@@ -50,6 +50,16 @@
+ 
+ from Proxy import Proxy
+ 
++# policy verdicts
++ANYPY_UNSPEC     = 0 # policy doesn't specify it, do something sensible 
++ANYPY_ACCEPT     = 1
++ANYPY_DENY       = 2
++ANYPY_REJECT     = 3 # continue and tell the client that we didn't do it 
++ANYPY_ABORT      = 4 # abort the connection 
++ANYPY_DROP       = 5 # continue and don't do it 
++ANYPY_POLICY     = 6 # Policy level will decide what to do 
++ANYPY_ERROR      = 7 # Error occured try to nice fail 
++
+ class AbstractAnyPyProxy(Proxy):
+ 	"""<class internal="yes" abstract="yes">
+         <summary>
+diff --git a/modules/anypy/anypy.c b/modules/anypy/anypy.c
+index 23db901..43880de 100644
+--- a/modules/anypy/anypy.c
++++ b/modules/anypy/anypy.c
+@@ -38,29 +38,409 @@
+ #include <zorp/pystream.h>
+ #include <zorp/registry.h>
+ #include <zorp/log.h>
++#include <zorp/streamline.h>
++#include <zorp/poll.h>
++
++#define ANYPY_ERROR "anypy.error"
++#define ANYPY_DEBUG "anypy.debug"
+ 
+ typedef struct _AnyPyProxy
+ {
+   ZProxy super;
++  guint max_line_length[EP_MAX];
++  ZPoll *poll;
++  gboolean quit;
++  gboolean linebased;
+ } AnyPyProxy;
+ 
+ extern ZClass AnyPyProxy__class;
+ 
++
++/**
++ * anypy_stream_init:
++ * @self: AnyPyProxy instance
++ * 
++ * This function is called upon startup to initialize our streams.
++ **/
++
++static gboolean
++anypy_stream_init(AnyPyProxy *self)
++{
++
++  z_proxy_enter(self);
++  if (!self->super.endpoints[EP_CLIENT] || !self->super.endpoints[EP_SERVER])
++    {
++      z_proxy_log(self, ANYPY_ERROR, 2, "Server side not yet connected, unable to init streams;");
++      z_proxy_return(self,FALSE);
++    }
++  z_proxy_log(self, ANYPY_DEBUG, 2, "linebased= %u;",self->linebased);
++  if (self->linebased)
++   {
++      z_proxy_log(self, ANYPY_ERROR, 2, "stacking in streamline;");
++	  self->super.endpoints[EP_CLIENT] = z_stream_push(self->super.endpoints[EP_CLIENT], z_stream_line_new(NULL, self->max_line_length[EP_CLIENT], ZRL_EOL_CRLF|ZRL_EOL_FATAL|ZRL_RETURN_EOL));
++	  self->super.endpoints[EP_SERVER] = z_stream_push(self->super.endpoints[EP_SERVER], z_stream_line_new(NULL, self->max_line_length[EP_SERVER], ZRL_EOL_CRLF|ZRL_EOL_FATAL|ZRL_RETURN_EOL));
++   }
++
++  z_proxy_return(self,TRUE);
++}
++
++/*
++ * a structure to use with the callback
++ */
++typedef struct _ZPolicyStreamCBData {
++       PyObject *callback;
++       AnyPyProxy *self;
++       ZPolicyStream *stream;
++       PyObject *obj;
++} ZPolicyStreamCBData;
++
++/*
++ * anypy_callback
++ * @stream: the stream
++ * @cond: the I/O condition (unused)
++ * @user_data: user data
++ *
++ * this is the C callback set in anypy_register_callback
++ * it will call the python callback function
++ */
++static gboolean
++anypy_callback(ZStream *stream, GIOCondition  cond G_GNUC_UNUSED, gpointer  user_data)
++{
++  ZPolicyObj *res;
++  guint resno;
++  ZPolicyStreamCBData *cbdata = (ZPolicyStreamCBData *) user_data;
++
++  z_proxy_log(cbdata->self, ANYPY_DEBUG, 2, "anypy_callback, %s;",cbdata->self->super.session_id);
++  {
++  ZPolicyObj *callback;
++  ZPolicyObj *args;
++  callback=cbdata->callback;
++  z_proxy_log(cbdata->self, ANYPY_DEBUG, 2, "callback=%p;",callback);
++  args = z_policy_var_build("(OO)",cbdata->stream,cbdata->obj);
++  z_proxy_log(cbdata->self, ANYPY_DEBUG, 2, "args=%p;",args);
++  z_policy_lock(cbdata->self->super.thread);  
++  res=z_policy_call_object(callback,args,"ooo");
++  z_policy_unlock(cbdata->self->super.thread);  
++//       cbdata->callback,
++//       z_policy_var_build("(OO)",cbdata->stream,cbdata->obj),"oooo");
++//       cbdata->self->super.session_id);
++  }
++ z_proxy_log(cbdata->self, ANYPY_DEBUG, 2, "res=%p;",res);
++ if (NULL == res)
++ {
++   cbdata->self->quit=1;
++   z_proxy_log(cbdata->self, ANYPY_ERROR, 2, "error calling callback;");
++   return FALSE;
++ }
++ else if (!z_policy_var_parse(res,"i",&resno))
++ {
++   cbdata->self->quit=1;
++   z_proxy_log(cbdata->self, ANYPY_ERROR, 2, "callback returned invalid value;");
++   return FALSE;
++ }
++ else
++ {
++   cbdata->self->quit=resno;
++ }
++ return !cbdata->self->quit;
++}
++
++/**
++ * anypy_cbdata_unref:
++ * @cbdata: ZPolicyStreamCBData instance
++ *
++ * This function frees cbdata and decrements the reference counts.
++ **/
++static void
++anypy_cbdata_unref(ZPolicyStreamCBData *cbdata)
++{
++  z_proxy_log(cbdata->self, ANYPY_ERROR, 2, "cbdata_unref");
++  Py_XDECREF(cbdata->callback);
++  Py_XDECREF(cbdata->obj);
++  Py_XDECREF((ZPolicyObj *)cbdata->self);
++  g_free(cbdata);
++}
++
++/**
++ * anypy_register_callback:
++ * @self: AnyPyProxy instance
++ * @args: Python args argument
++ * 
++ * registers callback for a stream
++ * args is (flags,callback,stream,obj)
++ **/
++
++static ZPolicyObj *
++anypy_register_callback(AnyPyProxy *self, ZPolicyObj *args)
++{
++  int flags;
++  ZPolicyStream *stream;
++
++  z_proxy_enter(self);
++  //FIXME register all needed callbacks for a stream once
++  ZPolicyStreamCBData *cbdata = g_new0(ZPolicyStreamCBData,1);
++  if (!z_policy_var_parse_tuple(args, "iOOO", &flags, &(cbdata->callback), &stream, &(cbdata->obj)))
++    {
++      PyErr_SetString(PyExc_AttributeError, "Arguments should be (flags,callback,stream,obj)");
++      z_proxy_return(self,NULL);
++    }
++  cbdata->self=self;
++  cbdata->stream=stream;//FIXME: we can get rid of it
++
++  Py_XINCREF(cbdata->callback);
++  Py_XINCREF(cbdata->obj);
++  //Py_XINCREF(cbdata->stream);
++  Py_XINCREF((ZPolicyObj *)cbdata->self);
++
++  Py_BEGIN_ALLOW_THREADS
++  z_stream_set_nonblock(stream->stream, TRUE);
++  z_stream_set_callback(stream->stream,flags,anypy_callback,(GDestroyNotify) cbdata,(GDestroyNotify) anypy_cbdata_unref);
++  z_stream_set_cond(stream->stream, flags, TRUE);
++  stream->stream->timeout = -2;
++  z_proxy_log(self, ANYPY_DEBUG, 2, "adding stream %p to poll %p, flags=%u;",stream->stream,self->poll,flags);
++  z_poll_add_stream(self->poll, stream->stream);
++  Py_END_ALLOW_THREADS
++
++  Py_XINCREF(Py_None);
++  z_proxy_return(self,Py_None);
++}
++
++/**
++ * anypy_add_to_poll:
++ * @self: AnyPyProxy instance
++ * @args: Python args argument
++ * 
++ * add a stream to the poll
++ * args is (stream,flags)
++ **/
++
++static ZPolicyObj *
++anypy_add_to_poll(AnyPyProxy *self, ZPolicyObj *args)
++{
++  ZPolicyStream *stream;
++  int flags;
++
++  z_proxy_enter(self);
++  if (!z_policy_var_parse_tuple(args, "Oi", &stream,&flags))
++    {
++      PyErr_SetString(PyExc_AttributeError, "Arguments should be (stream)");
++      z_proxy_return(self,NULL);
++    }
++  Py_XINCREF(stream);
++  Py_BEGIN_ALLOW_THREADS
++  z_proxy_log(self, ANYPY_DEBUG, 2, "adding stream %p to poll %p;",stream->stream,self->poll);
++  z_stream_set_cond(stream->stream, flags, TRUE);
++  z_poll_add_stream(self->poll, stream->stream);
++  Py_END_ALLOW_THREADS
++
++  Py_XINCREF(Py_None);
++  z_proxy_return(self,Py_None);
++}
++
++/**
++ * anypy_poll_iter_timeout:
++ * @self: AnyPyProxy instance
++ * @args: Python args argument
++ * 
++ * does a poll_iter_timeout
++ * args is (timeout)
++ **/
++static ZPolicyObj *
++anypy_poll_iter_timeout(AnyPyProxy * self, ZPolicyObj *args) 
++{
++  guint timeout;
++  guint res;
++
++  z_proxy_enter(self);
++
++  if ( self->quit )
++  {
++   goto err;
++  }
++  if (!z_policy_var_parse_tuple(args, "i", &timeout))
++    {
++      z_policy_raise_exception_obj(z_policy_exc_value_error, "Invalid arguments.");
++      z_proxy_return(self,NULL);
++    }
++  z_proxy_log(self, ANYPY_DEBUG, 2, "calling z_poll_iter_timeout;");
++  Py_BEGIN_ALLOW_THREADS
++  res=z_poll_iter_timeout(self->poll,timeout);
++  Py_END_ALLOW_THREADS
++  if(res)
++    {
++      ZPolicyObj *ret;
++      z_proxy_log(self, ANYPY_DEBUG, 2, "z_poll_iter_timeout returned true;");
++      ret=z_policy_var_build("i",1);
++      z_proxy_return(self,ret);
++    }
++err:
++  z_proxy_log(self, ANYPY_DEBUG, 2, "z_poll_iter_timeout returned false;");
++  Py_XINCREF(Py_None);
++  z_proxy_return(self,Py_None);
++}
++
++/**
++ * anypy_set_verdict:
++ * @self: AnyPyProxy instance
++ * @args: Python args argument
++ * 
++ * sets verdict for the parent proxy
++ * args is (verdict,description)
++ **/
++static ZPolicyObj *
++anypy_set_verdict(AnyPyProxy * self, ZPolicyObj *args) 
++{
++  gint verdict;
++  gchar *description;
++  ZPolicyObj *res = NULL;
++
++  z_proxy_enter(self);
++
++  if (!z_policy_var_parse_tuple(args, "is", &verdict, &description))
++    {
++      z_policy_raise_exception_obj(z_policy_exc_value_error, "Invalid arguments.");
++      z_proxy_return(self,NULL);
++    }
++  if (self->super.parent_proxy)
++    {
++      ZProxyStackIface *iface;
++      iface = z_proxy_find_iface(self->super.parent_proxy, Z_CLASS(ZProxyStackIface));
++      if (iface)
++        {
++          z_proxy_stack_iface_set_verdict(iface, verdict, description);
++          z_object_unref(&iface->super);
++        }
++    }
++  z_policy_var_ref(z_policy_none);
++  res = z_policy_none;
++  z_proxy_return(self,res);
++}
++
++/**
++ * anypy_config_set_defaults:
++ * @self: AnyPyProxy instance
++ *
++ * This function initializes various attributes exported to the Python layer
++ * for possible modification.
++ **/
++static void
++anypy_config_set_defaults(AnyPyProxy *self)
++{
++  z_proxy_enter(self);
++
++  self->max_line_length[EP_CLIENT] = 4096;
++  self->max_line_length[EP_SERVER] = 4096;
++  self->linebased = 1;
++
++  z_proxy_leave(self);
++}
++
++/**
++ * anypy_register_vars:
++ * @self: AyPyProxy instance
++ *
++ * This function is called upon startup to export Python attributes.
++ **/
++
++static void
++anypy_register_vars(AnyPyProxy *self)
++{
++  z_proxy_enter(self);
++  /* method for setting the proxy verdict. It should be used before the first write */
++  z_proxy_var_new(&self->super, "set_verdict",
++	Z_VAR_TYPE_METHOD | Z_VAR_GET,
++	self,anypy_set_verdict);
++  /* method for registering callback for a stream */
++  z_proxy_var_new(&self->super, "register_callback",
++	Z_VAR_TYPE_METHOD | Z_VAR_GET,
++	self,anypy_register_callback);
++  /* method for adding a stream to the poll */
++  z_proxy_var_new(&self->super, "add_to_poll",
++	Z_VAR_TYPE_METHOD | Z_VAR_GET,
++	self,anypy_add_to_poll);
++  /* method for iterating through poll */
++  z_proxy_var_new(&self->super, "poll_iter_timeout",
++	Z_VAR_TYPE_METHOD | Z_VAR_GET,
++	self,anypy_poll_iter_timeout);
++  /* size of line buffer of the client stream */
++  z_proxy_var_new(&self->super, "client_max_line_length",
++	Z_VAR_TYPE_INT | Z_VAR_GET | Z_VAR_SET_CONFIG | Z_VAR_GET_CONFIG,
++	&self->max_line_length[EP_CLIENT]);
++  /* size of line buffer of the server stream */
++  z_proxy_var_new(&self->super, "server_max_line_length",
++	Z_VAR_TYPE_INT | Z_VAR_GET | Z_VAR_SET_CONFIG | Z_VAR_GET_CONFIG,
++	&self->max_line_length[EP_SERVER]);
++  /* is the proxy line-based (streams are streamlines)? */
++  z_proxy_var_new(&self->super, "linebased",
++	Z_VAR_TYPE_INT | Z_VAR_GET | Z_VAR_SET_CONFIG | Z_VAR_GET_CONFIG,
++	&self->linebased);
++  z_proxy_leave(self);
++}
++
++/**
++ * anypy_config:
++ * @s: AnyPyProxy instance casted to ZProxy
++ *
++ * This function is called upon startup to configure the proxy.
++ * This calls the the __pre_config__, config and __post_config__ events.
++ **/
++static gboolean
++anypy_config(ZProxy *s)
++{
++  AnyPyProxy *self = Z_CAST(s, AnyPyProxy);
++
++  self->poll = z_poll_new();
++  anypy_config_set_defaults(self);
++  anypy_register_vars(self);
++  if (Z_SUPER(s, ZProxy)->config(s))
++    {
++      return TRUE;
++    }
++  return FALSE;
++}
++
++static gboolean
++anypy_startup(ZProxy * s)
++{
++  AnyPyProxy *self = Z_CAST(s, AnyPyProxy);
++
++  z_proxy_enter(self);
++  self->quit = 0;
++  if (!z_proxy_connect_server(&self->super, NULL, 0) || !anypy_stream_init(self))
++    {
++      z_proxy_return(self,FALSE);
++    }
++  if (Z_SUPER(s,ZProxy)->startup(s))
++    {
++      z_proxy_return(self,TRUE);
++    }
++  z_proxy_return(self,FALSE);
++}
++
+ static void
+ anypy_main(ZProxy * s)
+ {
+   AnyPyProxy *self = Z_CAST(s, AnyPyProxy);
+   ZPolicyObj *res;
+   gboolean called;
+-  
++
+   z_proxy_enter(self);
++  self->quit = 0;
+   z_policy_lock(self->super.thread);  
+   res = z_policy_call(self->super.handler, "proxyThread", NULL, &called, self->super.session_id);
+   z_policy_var_unref(res);
++  z_poll_unref(self->poll);
++  self->poll = NULL;
+   z_policy_unlock(self->super.thread);
+   z_proxy_return(self);
+ }
+ 
++/**
++ * anypy_proxy_new:
++ * @params: parameters for the AnyPyProxy class constructor
++ *
++ * This function is called upon startup to create a new AnyPy proxy.
++ **/
+ ZProxy *
+ anypy_proxy_new(ZProxyParams *params)
+ {
+@@ -77,8 +457,8 @@ ZProxyFuncs anypy_proxy_funcs =
+     Z_FUNCS_COUNT(ZProxy),
+     NULL
+   },
+-  NULL,
+-  NULL,
++  anypy_config,
++  anypy_startup,
+   anypy_main,
+   NULL,
+   NULL,
+diff --git a/pylib/Zorp/Stream.py b/pylib/Zorp/Stream.py
+index 99c9747..db4b354 100644
+--- a/pylib/Zorp/Stream.py
++++ b/pylib/Zorp/Stream.py
+@@ -33,6 +33,19 @@
+ </module>
+ """
+ 
++#FIXME: document and yank 'em
++#G_IO_IN
++#G_IO_OUT
++#G_IO_STATUS_ERROR = 0
++#G_IO_STATUS_NORMAL = 1
++#G_IO_STATUS_EOF = 2
++#G_IO_STATUS_AGAIN = 3
++
++#ZRL_EOL_NL              =	0x00000001 # end-of-line is indicated by nl 
++#ZRL_EOL_CRLF            =	0x00000002 # end-of-line is indicated by crlf pair 
++#ZRL_EOL_NUL             =	0x00000004
++#ZRL_EOL_FATAL           =	0x00000008 # erroneous eol mark is fatal 
++
+ class Stream:
+ 	"""
+         <class maturity="stable" internal="yes">
+@@ -155,3 +168,4 @@ class Stream:
+                 </method>
+ 
+ 		"""
++
+diff --git a/zorpconfig.h b/zorpconfig.h
+index 14e08ea..4ae017c 100644
+--- a/zorpconfig.h
++++ b/zorpconfig.h
+@@ -5,7 +5,7 @@
+ #define ENABLE_CONNTRACK 1
+ 
+ /* Enable debugging */
+-#define ENABLE_DEBUG 1
++#define ENABLE_DEBUG 0
+ 
+ /* Enable ipf based tproxy */
+ #define ENABLE_IPFILTER_TPROXY 0
+@@ -128,7 +128,7 @@
+ #define PACKAGE_VERSION ""
+ 
+ /* The size of `void *', as computed by sizeof. */
+-#define SIZEOF_VOID_P 8
++#define SIZEOF_VOID_P 4
+ 
+ /* Define to 1 if you have the ANSI C header files. */
+ #define STDC_HEADERS 1
+@@ -137,19 +137,19 @@
+ #define VERSION "3.1.14"
+ 
+ /* Configuration date */
+-#define ZORP_CONFIG_DATE "2008/05/29"
++#define ZORP_CONFIG_DATE "2008/08/16"
+ 
+ /* datadir */
+-#define ZORP_DATADIR "/home/bazsi/zwa/install/zorp-3.1/share/zorp"
++#define ZORP_DATADIR "/usr/share/zorp"
+ 
+ /* libdir */
+-#define ZORP_LIBDIR "/home/bazsi/zwa/install/zorp-3.1/lib/zorp"
++#define ZORP_LIBDIR "/usr/lib/zorp"
+ 
+ /* Required license version */
+ #define ZORP_LICENSE_VERSION "3.1"
+ 
+ /* pidfiledir */
+-#define ZORP_PIDFILEDIR "/home/bazsi/zwa/install/zorp-3.1/var/run/zorp/"
++#define ZORP_PIDFILEDIR "/var/run/zorp/"
+ 
+ /* Required product name in license */
+ #define ZORP_PRODUCT_NAME "Zorp Professional"
+@@ -158,7 +158,7 @@
+ #define ZORP_SOURCE_REVISION "devel@balabit.hu--zorp-1/zorp-core--mainline--3.1--patch-703"
+ 
+ /* localstatedir */
+-#define ZORP_STATEDIR "/home/bazsi/zwa/install/zorp-3.1/var"
++#define ZORP_STATEDIR "/var/lib/zorp"
+ 
+ /* sysconfdir */
+-#define ZORP_SYSCONFDIR "/home/bazsi/zwa/install/zorp-3.1/etc/zorp"
++#define ZORP_SYSCONFDIR "/etc/zorp"
